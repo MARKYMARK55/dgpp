@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <format>
 #include <stdexcept>
 #include <string>
@@ -299,11 +300,32 @@ int64_t Scheduler::new_blocks(const Request& r, const PrefixPlan& plan) const {
   return std::max<int64_t>(blocks, 0);
 }
 
-int Scheduler::next_admissible() {
+std::vector<int> Scheduler::queued_order() const {
+  std::vector<int> order;
+  for (size_t i = 0; i < requests_.size(); ++i)
+    if (requests_[i].state == State::kQueued) order.push_back(static_cast<int>(i));
+  // Stable: arrival order within a priority, and plain arrival order when
+  // every queued request has the same one.
+  std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+    return requests_[static_cast<size_t>(a)].spec.priority < requests_[static_cast<size_t>(b)].spec.priority;
+  });
+  return order;
+}
+
+bool Scheduler::withhold_seat(const Request& r, int open_slots) const {
+  return r.spec.priority > 0 && open_slots == 1 && slots_.size() > 1;
+}
+
+int Scheduler::next_admissible(int64_t oneshot_budget, int below_priority) {
   int64_t free_blocks =
       engine_->pool_blocks_total() - engine_->pool_blocks_in_use();
-  for (size_t i = 0; i < requests_.size(); ++i) {
-    if (requests_[i].state != State::kQueued) continue;
+  const int open_slots = static_cast<int>(std::count(slots_.begin(), slots_.end(), -1));
+  for (const int arrival : queued_order()) {
+    const size_t i = static_cast<size_t>(arrival);
+    if (requests_[i].spec.priority >= below_priority) break;  // the order is by priority: none after it qualifies
+    // The urgent pass: a prompt that needs a chunked read-in is not its business.
+    if (oneshot_budget >= 0 && needs_chunked_prefill(arrival, oneshot_budget)) continue;
+    if (withhold_seat(requests_[i], open_slots)) continue;
     // No head-of-line blocking: the OLDEST request that FITS admits. A
     // large deferred request must not dam the queue behind it — the
     // starvation it could suffer under an unbounded small-request stream
@@ -362,6 +384,10 @@ void Scheduler::validate_new(const SchedulerRequest& request) const {
   if (request.prompt.empty())
     throw std::invalid_argument("Scheduler: request '" + request.id +
                                "' has an empty prompt");
+  if (request.priority < SchedulerRequest::kPriorityMin || request.priority > SchedulerRequest::kPriorityMax)
+    throw std::invalid_argument("Scheduler: request '" + request.id + "' has a priority outside [" +
+                                std::to_string(SchedulerRequest::kPriorityMin) + ", " +
+                                std::to_string(SchedulerRequest::kPriorityMax) + "]");
   validate_image_inputs(request.images, request.prompt.size());
   if (!request.images.empty() && !engine_->supports_images())
     throw std::invalid_argument("Scheduler: this engine does not support image inputs");
@@ -532,6 +558,7 @@ std::vector<int> Scheduler::admissible_group(int first, int64_t budget) {
   for (size_t i = static_cast<size_t>(first) + 1; i < requests_.size() && open_slots > 0; ++i) {
     const Request& r = requests_[i];
     if (!groupable(r)) continue;
+    if (withhold_seat(r, open_slots)) continue;  // a background member does not take the group's last seat
     const int64_t P = static_cast<int64_t>(r.spec.prompt.size());
     if (total + P > total_limit) continue;
     const int64_t need = reserve_blocks(r);
@@ -802,11 +829,12 @@ bool Scheduler::needs_chunked_prefill(int arrival, int64_t budget) const {
          static_cast<int64_t>(r.spec.prompt.size()) > budget;
 }
 
-bool Scheduler::admit_fitting(int64_t& tick_cap, int64_t budget, bool first_prefill) {
+bool Scheduler::admit_fitting(int64_t& tick_cap, int64_t budget, bool first_prefill, bool oneshots_only,
+                              int below_priority) {
   // Zero is the monolithic sentinel to admissible_group(), not a remaining
   // budget. Stop before either grouping or the prefix-cache eviction scan.
   if (budget > 0 && tick_cap <= 0) return false;
-  const int first = next_admissible();
+  const int first = next_admissible(oneshots_only ? budget : -1, below_priority);
   if (first < 0) return false;
   const int64_t P =
       static_cast<int64_t>(requests_[static_cast<size_t>(first)].spec.prompt.size());
@@ -1295,7 +1323,34 @@ bool Scheduler::quantum() {
         ? policy_.prefill_idle_budget_tokens : policy_.prefill_budget_tokens;
   };
   const int64_t budget = prefill_budget();
+  // Priority: a queued prompt more urgent than every prompt being read, and
+  // short enough for one tick to read whole, is read NOW out of this tick's
+  // budget, and the tick is its own: the read-ins it overtook keep their
+  // slots and resume on the next tick. Without this a chat message behind a
+  // background prompt's read-in waited for the whole read-in (the read-in
+  // takes each tick's budget and leaves no room beside it). Skipped — the
+  // queue is not even looked at — unless such a request is waiting, so a
+  // run with one priority class ticks exactly as before.
+  bool urgent_took_tick = false;
   if (prefill_in_flight) {
+    int reading = std::numeric_limits<int>::max();
+    bool urgent_waiting = false;
+    for (const Request& r : requests_)
+      if (r.state == State::kPrefilling) reading = std::min(reading, r.spec.priority);
+    for (const Request& r : requests_)
+      if (r.state == State::kQueued && r.spec.priority < reading) urgent_waiting = true;
+    if (urgent_waiting) {
+      int64_t urgent_cap = budget;
+      while (admit_fitting(urgent_cap, budget, /*first_prefill=*/false, /*oneshots_only=*/true, reading)) {
+        admitted_any = true;
+        progressed = true;
+        urgent_took_tick = true;
+      }
+    }
+  }
+  if (urgent_took_tick) {
+    // The tick was the urgent prompt's: no read-in is advanced and nothing else is admitted.
+  } else if (prefill_in_flight) {
     // A chunked prefill is in flight: advance a fair slice on equal aligned
     // shares of the tick's budget (all prefills when they fit), begin at most
     // one new chunked read-in, and admit fitting one-shots/groups into the
@@ -1314,9 +1369,12 @@ bool Scheduler::quantum() {
     if (free_slot() >= 0 && inflight.size() < max_advances) {
       const int64_t free_blocks =
           engine_->pool_blocks_total() - engine_->pool_blocks_in_use();
-      for (size_t i = 0; i < requests_.size(); ++i) {
-        if (requests_[i].state != State::kQueued) continue;
+      const int open_slots = static_cast<int>(std::count(slots_.begin(), slots_.end(), -1));
+      // (Most urgent first: queued_order() is arrival order unless priorities differ.)
+      for (const int queued : queued_order()) {
+        const size_t i = static_cast<size_t>(queued);
         if (!needs_chunked_prefill(static_cast<int>(i), budget)) continue;
+        if (withhold_seat(requests_[i], open_slots)) continue;
         if (new_blocks(requests_[i], plan_prefix(requests_[i])) <= free_blocks) {
           begin_arrival = static_cast<int>(i);
           break;
@@ -1324,6 +1382,19 @@ bool Scheduler::quantum() {
       }
     }
     if (begin_arrival >= 0) inflight.push_back(begin_arrival);
+    // Priority: the tick's budget is for the most urgent class being read (or
+    // beginning). Prompts of a less urgent class sit this tick out: one in
+    // flight keeps its slot and its place, one that would have begun stays
+    // queued. Nothing is removed when the classes are all one.
+    if (inflight.size() > 1) {
+      int top = std::numeric_limits<int>::max();
+      for (const int a : inflight) top = std::min(top, requests_[static_cast<size_t>(a)].spec.priority);
+      inflight.erase(std::remove_if(inflight.begin(), inflight.end(),
+                                    [&](int a) { return requests_[static_cast<size_t>(a)].spec.priority > top; }),
+                     inflight.end());
+      if (begin_arrival >= 0 && std::find(inflight.begin(), inflight.end(), begin_arrival) == inflight.end())
+        begin_arrival = -1;
+    }
     if (inflight.size() > max_advances) {
       // Idle admissions may outnumber the smaller busy budget's chunks.
       // Rotate a bounded slice so every unfinished request gets a turn;
